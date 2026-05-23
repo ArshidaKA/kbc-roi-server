@@ -3,6 +3,14 @@ const Staff = require('../models/Staff');
 const Stock = require('../models/Stock');
 const { ensureMonthlyBills } = require('./staffController');
 
+// ── Opening / carry-forward balances ──────────────────────────────────────
+const OPENING_BALANCES = {
+  cash:    30780,
+  federal: 51855.15,
+  vibgyor: 73000,
+  asif:    7742,
+};
+
 const dateFilter = (filter, start, end) => {
   const now = new Date();
   switch (filter) {
@@ -78,7 +86,15 @@ exports.getSummary = async (req, res) => {
     const entries = await Entry.find(query);
 
     let totalRevenue = 0, totalPC = 0, totalIndirect = 0, expCredit = 0, expCreditSettled = 0;
-    const accounts = { cash: 0, federal: 0, vibgyor: 0, asif: 0 };
+
+    // Seed accounts with opening balances (only for 'all' filter, so balances are always total)
+    const accounts = {
+      cash:    OPENING_BALANCES.cash,
+      federal: OPENING_BALANCES.federal,
+      vibgyor: OPENING_BALANCES.vibgyor,
+      asif:    OPENING_BALANCES.asif,
+    };
+
     const revenueByChannel = { cash: 0, federal: 0, vibgyor: 0, asif: 0 };
     const expenseSplit = {};
     const trendMap = {};
@@ -116,9 +132,6 @@ exports.getSummary = async (req, res) => {
       expCredit        += ec;
       expCreditSettled += ecs;
 
-      // Deduct paid expenses from accounts + track per-account breakdown.
-      // Non-credit: full `amount` left the account when recorded.
-      // Credit: only `creditSettled` reduces the account (payments toward vendor credit).
       const deductTrack = (item, spendLabel) => {
         if (!item || !item.fromAccount) return;
         const acct = item.fromAccount;
@@ -157,13 +170,11 @@ exports.getSummary = async (req, res) => {
       (e.expenses?.royaltyFees || []).forEach((r, i) => deductTrack(r, r.label ? `Royalty: ${r.label}` : `Royalty (${i + 1})`));
       (e.expenses?.marketing || []).forEach((m, i) => deductTrack(m, m.label ? `Marketing: ${m.label}` : `Marketing (${i + 1})`));
       (e.expenses?.other || []).forEach((o, i) => deductTrack(o, o.label ? `Other: ${o.label}` : `Other (${i + 1})`));
-      // Salary: lines synced from Staff → Settle are already deducted via staff settlements below — skip to avoid double-count.
       (e.expenses?.salary || []).forEach((s) => {
         if (s && s.sourceSettlementId) return;
         deductTrack(s, 'Salary (ROI, manual)');
       });
 
-      // Expense split
       const addSplit = (key, amt) => { if (amt) expenseSplit[key] = (expenseSplit[key] || 0) + amt; };
       e.purchaseCost.forEach(p => addSplit('Purchase Cost', p.amount));
       addSplit('Food & Refreshment', ops.foodRefreshment?.amount);
@@ -183,7 +194,6 @@ exports.getSummary = async (req, res) => {
       (e.expenses?.other  || []).forEach(o => addSplit('Other',  o.amount));
       (e.expenses?.salary || []).forEach(s => addSplit('Salary', s.amount));
 
-      // Trend
       const day = new Date(e.date).toISOString().split('T')[0];
       if (!trendMap[day]) trendMap[day] = { date: day, revenue: 0, expenses: 0, profit: 0 };
       trendMap[day].revenue  += dayRev;
@@ -193,14 +203,12 @@ exports.getSummary = async (req, res) => {
 
     const trend = Object.values(trendMap).sort((a, b) => a.date.localeCompare(b.date));
 
-    // ── Staff salary: outstanding + deduct settlements from accounts ──
     const allStaff = await Staff.find({ isActive: true });
     await Promise.all(allStaff.map(ensureMonthlyBills));
     const totalSalaryBill     = allStaff.reduce((s, st) => s + st.totalBilled,  0);
     const totalSalarySettled  = allStaff.reduce((s, st) => s + st.totalSettled, 0);
     const salaryOutstanding   = totalSalaryBill - totalSalarySettled;
 
-    // Deduct salary settlements from the relevant account balance
     allStaff.forEach(st => {
       st.settlements.forEach(settlement => {
         if (!inDateRange(df, settlement.date)) return;
@@ -232,6 +240,7 @@ exports.getSummary = async (req, res) => {
         note: s.note || '',
       })).sort((a, b) => new Date(b.date) - new Date(a.date));
       accountBreakdown[k] = {
+        openingBalance: OPENING_BALANCES[k],   // ← exposed so the modal can show it
         revenueIn: n(x.revenueIn),
         purchasePaid: n(x.purchasePaid),
         indirectLines,
@@ -241,10 +250,8 @@ exports.getSummary = async (req, res) => {
       };
     });
 
-    // Combined credit = unpaid vendor expenses + unpaid salary
     const totalCreditCombined = expCredit + salaryOutstanding;
 
-    // ── Stock ──
     const todayStart = new Date(); todayStart.setHours(0,0,0,0);
     const todayEnd   = new Date(); todayEnd.setHours(23,59,59,999);
     const todayOpening = await Stock.findOne({ type: 'opening', date: { $gte: todayStart, $lte: todayEnd } });
@@ -279,7 +286,6 @@ exports.getSummary = async (req, res) => {
       totalIndirect,
       netProfit: totalRevenue - totalPC - totalIndirect,
       margin: totalRevenue ? (((totalRevenue - totalPC - totalIndirect) / totalRevenue) * 100).toFixed(1) : '0',
-      /** Pop-up / drill-down for dashboard cards */
       cardDetails: {
         revenue: { lines: revenueLines, total: totalRevenue },
         expenses: {
@@ -302,17 +308,15 @@ exports.getSummary = async (req, res) => {
           expenseCreditSettled: expCreditSettled,
           totalSalarySettled,
         },
-        /** Tap an account card — how ending balance is built */
         accountBreakdown,
       },
-      // Credit breakdown
       expCredit,
       expCreditSettled,
       salaryOutstanding,
       totalSalarySettled,
       totalCredit: totalCreditCombined,
-      // Accounts — already has settlements deducted
       accounts,
+      openingBalances: OPENING_BALANCES,   // ← sent to frontend for reference
       expenseSplit: Object.entries(expenseSplit).filter(([, v]) => v > 0).map(([k, v]) => ({ name: k, value: v })),
       trend,
       staff: { totalBill: totalSalaryBill, totalSettled: totalSalarySettled, outstanding: salaryOutstanding },
